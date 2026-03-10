@@ -83,7 +83,7 @@ Reflow will not, in v0.1:
 * provide a web UI or service backend
 * perform dynamic provider capability planning beyond config-based mapping
 
-Provider-native tool approvals remain the provider’s responsibility, not Reflow’s.
+Provider-native tool approvals remain the provider's responsibility, not Reflow's.
 
 ## 5. Primary users
 
@@ -269,7 +269,7 @@ A workflow must define at least one step.
 
 `notes.md` is workflow-local orchestration guidance.
 
-It is appended by Reflow into the workflow’s message history and therefore becomes part of the effective provider session context for steps in that workflow.
+It is appended by Reflow into the workflow's message history and therefore becomes part of the effective provider session context for steps in that workflow.
 
 ## 12. Step contract
 
@@ -375,12 +375,12 @@ This is structural, not semantic.
 ### 12.8 `success.when`
 
 Natural-language semantic condition answering:
-“Did this step achieve its local purpose well enough to continue?”
+"Did this step achieve its local purpose well enough to continue?"
 
 ### 12.9 `failure.when`
 
 Natural-language semantic condition answering:
-“Did this step hit a terminal or unrecoverable condition?”
+"Did this step hit a terminal or unrecoverable condition?"
 
 Recoverable conditions should be handled by routing or retry, not by `failure.when`.
 
@@ -411,7 +411,7 @@ v0.1 convention:
 * extra support files are allowed but not required or assumed by default
 * Reflow is only required to load `SKILL.md` in v0.1
 
-Reflow never exposes the full skill library to a single step. It loads only the current step’s selected skill.
+Reflow never exposes the full skill library to a single step. It loads only the current step's selected skill.
 
 ### 13.1 Working directory semantics
 
@@ -419,7 +419,7 @@ By default, all `skill` and `workflow` actions run from the directory where Refl
 
 `cli` steps may override the working directory through `action.with.cwd`.
 
-Child workflows inherit the parent run’s working directory in v0.1.
+Child workflows inherit the parent run's working directory in v0.1.
 
 This matters because provider-native project instruction discovery is sensitive to working directory and repository hierarchy. Reflow must keep working-directory behavior stable across parent and child runs.
 
@@ -438,9 +438,9 @@ Workflows themselves do not specify provider choice.
 
 ### 14.1 Provider failure behavior
 
-If the configured provider for a step or route evaluator is unavailable, Reflow fails fast.
+If the configured provider for a step or route evaluator is unavailable at invocation time, Reflow fails fast.
 
-There is no automatic fallback in v0.1.
+There is no automatic fallback in v0.1. There is no upfront provider availability check; unavailability is detected when the provider is actually invoked, which surfaces the problem at the point of use.
 
 ### 14.2 Failure recording
 
@@ -518,14 +518,20 @@ Failure diagnostics are captured through `failure_type` and `failure_reason` fie
 Examples of `failure_type`:
 
 * `semantic_failure`
+* `execution_failure`
 * `provider_unavailable`
+* `provider_timeout`
 * `route_unresolved`
 * `route_eval_conflict`
 * `ambiguous_evaluation`
-* `missing_required_outputs`
+* `missing_outputs`
+* `malformed_response`
+* `malformed_route_eval`
+* `max_iter_exceeded`
 * `retries_exhausted`
-* `invalid_provider_response`
-* `filesystem_error`
+* `config_error`
+* `workflow_load_error`
+* `internal_error`
 
 ## 17. Full-run context model
 
@@ -619,12 +625,23 @@ In v0.1, `context_mode` defaults to `full_run`, meaning the child inherits the f
 
 A workflow step completes when its child run reaches a terminal state.
 
+Under `context_mode: full_run`, the parent has access to the child's full **visible** execution context by default once the child reaches that terminal state.
+
 The parent sees:
 
-* the child run’s full visible message history
+* the child run's full visible message history
+* all child artifact paths available in the workspace
 * child run id
 * child terminal status
-* child state reference
+* child `state.json` reference
+
+This means subsequent parent-step execution may rely on the child's persisted visible context in the same way it relies on any other prior run context: through canonical message history plus artifact path references.
+
+The child's message ledger remains physically stored in the child run folder as the child's own canonical ledger. Reflow does **not** rewrite, flatten, or mutate the child ledger into a separate parent-owned history file. Instead, the parent gains visibility to that child ledger as part of the visible run context available for later parent steps.
+
+If the parent step produces its own outputs based on child-run results, those outputs must reference the child run by stable identifiers and relative paths so that downstream steps can inspect the original child evidence directly.
+
+This behavior is the default and correct v0.1 interpretation of nested workflows under `full_run`: child execution is isolated as its own run for state management, but its visible context is available to the parent after child completion.
 
 ### 18.5 Child semantics
 
@@ -690,20 +707,21 @@ If retries are exhausted, fail the run.
 
 This conflict does **not** consume `max_iter`.
 
-## 20. Deterministic checks before semantic routing
+## 20. Deterministic checks and execution ordering
 
-Reflow must first evaluate deterministic runtime facts.
+Before executing a semantic visit, Reflow must check `max_iter`. After execution, it applies deterministic checks before semantic evaluation.
 
-The evaluation sequence is:
+The full evaluation sequence is:
 
-1. Attempt step execution
-2. If execution-stage failure occurred, apply retry policy directly and skip semantic evaluation
-3. Check whether required outputs exist
-4. If required outputs are missing, apply retry policy directly and skip semantic evaluation
-5. Check whether the next semantic visit would exceed `max_iter`
-6. Then proceed to semantic evaluation
+1. Check whether the next semantic visit would exceed `max_iter` (before execution)
+2. Increment semantic visit counter, reset retry budget
+3. Attempt step execution
+4. If execution-stage failure occurred, apply retry policy directly and skip semantic evaluation
+5. Check whether required outputs exist
+6. If required outputs are missing, apply retry policy directly and skip semantic evaluation
+7. Proceed to semantic evaluation
 
-The key rule is: if the provider process crashed, timed out, or failed to produce the required outputs, there is nothing meaningful to semantically evaluate.
+The key rule is: if the provider process crashed, timed out, or failed to produce the required outputs, there is nothing meaningful to semantically evaluate. And if the step has exhausted its semantic visit budget, there is no point executing it again.
 
 ### 20.1 Semantic visit increment rule
 
@@ -711,7 +729,7 @@ When workflow routing selects a step, Reflow begins a new **semantic visit**.
 
 Before executing that visit, it checks whether `semantic_iteration_number + 1 > max_iter`.
 
-* If yes, the run fails with `max iteration exceeded`
+* If yes, the run fails with `max_iter_exceeded`
 * If no, it increments `semantic_iteration_number` and starts attempt `retry_number = 0`
 
 Retries within that visit do not increment `semantic_iteration_number`.
@@ -827,10 +845,11 @@ If `selected_route = escalate`, terminal status resolves to `escalated`.
 
 Failure and route precedence:
 
-* if `step_success = true` and `step_failure = true` → apply retry policy
-* if `step_failure = true` and `selected_route = escalate` → `escalated`
-* if `step_failure = true` and no escalation route applies → `failed`
+* if `step_success = true` and `step_failure = true` → apply retry policy (evaluator conflict)
+* if `step_failure = true` → `failed` (semantic failure is always terminal, regardless of routes)
 * otherwise follow `selected_route`
+
+Escalation is a routing outcome for successful steps where the workflow author decides automated continuation is not appropriate. It is not a failure-recovery mechanism.
 
 ## 23. Runtime artifact structure
 
@@ -854,6 +873,7 @@ Each attempt contains:
 
 Contains:
 
+* schema version
 * run id
 * workflow name
 * workflow version or hash
@@ -985,15 +1005,15 @@ The implementation must differentiate CLI exit categories.
 
 Recommended default codes:
 
-| Code | Meaning                                                                                               |
-| ---- | ----------------------------------------------------------------------------------------------------- |
-| 0    | Run completed successfully                                                                            |
-| 20   | Provider unavailable (fail fast)                                                                      |
-| 21   | Terminal step failure, including semantic failure and execution-stage failure after retries exhausted |
-| 22   | Unresolved routing, route conflict, or ambiguous evaluation after retries exhausted                   |
-| 23   | Max iteration exceeded                                                                                |
-| 24   | Escalated (operator stop or workflow escalation)                                                      |
-| 25   | Internal orchestrator or runtime error                                                                |
+| Code | Meaning |
+| ---- | ------- |
+| 0 | Run completed successfully |
+| 20 | Provider unavailable (fail fast) |
+| 21 | Terminal step failure, including semantic failure and execution-stage failure after retries exhausted |
+| 22 | Unresolved routing, route conflict, or ambiguous evaluation after retries exhausted |
+| 23 | Max iteration exceeded |
+| 24 | Escalated (operator stop or workflow escalation) |
+| 25 | Internal orchestrator or runtime error |
 
 Exact numeric values are not mandatory, but stable differentiation between these categories **is** mandatory and must be documented per deployment.
 
@@ -1029,7 +1049,7 @@ Retry execution-stage failures (provider timeout, malformed response, malformed 
 
 ### 27.6 Provider failure behavior
 
-Fail fast when the configured provider is unavailable.
+Fail fast when the configured provider is unavailable at invocation time.
 
 ### 27.7 Nested workflows
 
@@ -1046,6 +1066,22 @@ Every runtime failure appends descriptive error messages to `messages.jsonl`, `a
 ### 27.10 CLI exit codes
 
 Reflow returns differentiated exit codes for success, provider unavailable, terminal step failure, routing failure, max iteration exceeded, escalation, and internal runtime error.
+
+### 27.11 Semantic failure
+
+When a step evaluates to semantic failure (`failure.when = true` from a valid, non-conflicting evaluation), the run fails immediately without retry.
+
+### 27.12 Max iteration exceeded
+
+When a step exhausts its `max_iter` budget, the run fails. This check occurs before step execution, not after. The retry budget is not involved.
+
+### 27.13 Retry budget reset
+
+The retry budget resets to its full value at the start of each new semantic visit to a step.
+
+### 27.14 Operator stop
+
+An operator stop (SIGINT/SIGTERM) terminates the run with `escalated` status and leaves the run in a consistent state with final artifacts written.
 
 ## 28. Risks
 

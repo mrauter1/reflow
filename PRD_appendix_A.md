@@ -1,478 +1,151 @@
-# Reflow — Product Requirements Document
+## Appendix A — Provider integration, file contracts, and runtime interfaces
 
-## Reflow v0.1
+This appendix is **standalone and normative** for implementation. An agent implementing the orchestrator can use this appendix, plus the PRD, as the source of truth for all provider integrations, runtime contracts, and file formats.
 
-**Project name:** Reflow
-**Category:** Deterministic workflow runtime
+This appendix intentionally distinguishes between:
 
-## 1. Product summary
+* **documented provider capabilities**
+* **project-specific implementation rules**
 
-Reflow is a file-first, local CLI runtime for reusable AI-assisted workflows.
+The provider capabilities below are based on the current official Codex CLI and Claude Code documentation. Codex supports scripted `codex exec`, JSONL output, JSON-Schema-constrained final output, resume, layered `AGENTS.md`, and repo skills under `.agents/skills`. Claude Code supports `claude -p`, JSON output with `--json-schema`, `--allowedTools`, `--append-system-prompt` / `--append-system-prompt-file`, `--continue`, `--resume`, layered `CLAUDE.md`, and repo skills under `.claude/skills`. ([OpenAI Developers][1])
 
-It executes declarative workflows through a small deterministic kernel and delegates actual work to pluggable executors such as:
+---
 
-* Codex CLI
-* Claude Code CLI
-* nested workflows
-* local shell or CLI commands
+## A1. Normative implementation rules
 
-Reflow is **not** a planner or autonomous manager. It manages:
+The implementation MUST follow these rules:
 
-* runs
-* steps
-* semantic iterations
-* attempts
-* artifacts
-* retries
-* semantic routing
-* terminal states
+1. `.ai/skills` is the only canonical skill source in v0.1.
+2. The orchestrator MUST NOT depend on `.agents/skills` or `.claude/skills`.
+3. The orchestrator MUST NOT manually append `AGENTS.md` or `CLAUDE.md`; those are provider-native instruction layers.
+4. `full_run` means the full canonical orchestrator message history, not full file contents dumped into prompts.
+5. Artifacts MUST be referenced by full relative path in message history; they MUST NOT be inlined by default.
+6. All step-local routes, plus `success.when` and `failure.when`, MUST be evaluated in one route-evaluator pass that returns JSON.
+7. Provider unavailability MUST fail fast.
+8. Human approvals are out of scope for v0.1.
+9. Nested workflows are in scope for v0.1.
+10. The canonical source of replayable state is the orchestrator’s own message ledger and artifacts, not provider-native session state.
 
-Domain logic lives in workflows. Role logic lives in skills. Provider-specific execution behavior lives in configuration and adapters.
+---
 
-The first concrete workflow is a review → screen → implement → verify loop, but Reflow is intended to support broader technical and operational workflows over time.
+## A2. Codex CLI integration surface
 
-## 2. Problem statement
+### A2.1 Core command
 
-Advanced coding and analysis agents can already do a large share of expert-level labor, but the bottleneck is still the manual scaffolding around them.
+Use `codex exec` for scripted, non-interactive runs. Codex documents `codex exec` as the entrypoint for scripts and CI. ([OpenAI Developers][1])
 
-Useful loops are often discovered empirically and then repeated by hand:
+### A2.2 Working directory
 
-* review work
-* screen findings
-* implement worthwhile changes
-* verify
-* repeat until convergence
+Use `--cd` / `-C` to set the workspace root before processing the request. ([OpenAI Developers][2])
 
-These loops are powerful but fragile. They are hard to scale because they are:
+### A2.3 Permission model
 
-* prompt-driven instead of file-driven
-* difficult to inspect after the fact
-* hard to reuse consistently
-* dependent on manual orchestration
-* easy to drift over time
+For automation, Codex documents:
 
-Reflow solves this by turning useful loops into explicit workflow definitions executed by a deterministic runtime that preserves every attempt and every artifact.
+* default `codex exec` behavior is **read-only sandbox**
+* `--full-auto` allows edits
+* `--sandbox danger-full-access` allows broader access
+* `--ask-for-approval` accepts `untrusted | on-request | never` at the CLI level. ([OpenAI Developers][1])
 
-## 3. Goals
+### A2.4 Machine-readable output
 
-Reflow must:
+Use `--json` when you need a JSONL event stream. Codex documents that `--json` makes `stdout` a JSON Lines stream containing events such as:
 
-* provide a **general workflow runtime**, not a hardcoded code-review bot
-* keep authored workflows readable and maintainable in-repo
-* support iterative loops with immutable attempt history
-* support semantic success, semantic failure, and semantic routing
-* support nested workflows in v0.1
-* keep provider choice outside workflow definitions
-* fail fast if the configured provider is unavailable
-* rely only on visible persisted context, not hidden provider memory
-* use terminal-native execution in v0.1
-* preserve enough history for providers to infer what is current from the run history
-* separate execution-stage retry from semantic iteration budgets
+* `thread.started`
+* `turn.started`
+* `turn.completed`
+* `turn.failed`
+* `item.*`
+* `error`
 
-## 4. Non-goals
+The JSONL stream can include agent messages, reasoning, command executions, file changes, MCP tool calls, web searches, and plan updates. ([OpenAI Developers][1])
 
-Reflow will not, in v0.1:
+### A2.5 Structured final output
 
-* implement orchestrator-level human approvals
-* implement a context compiler or pruning engine
-* implement parallel branches or a graph runtime
-* implement a central policy engine
-* implement a global schema registry
-* depend on `.agents/skills` or `.claude/skills`
-* depend on hidden provider-private chain-of-thought
-* provide a web UI or service backend
-* perform dynamic provider capability planning beyond config-based mapping
+Use `--output-schema <schema.json>` together with `-o <output.json>` when you need a schema-constrained final response written to disk. Codex documents this as the supported way to get stable structured outputs for downstream automation. ([OpenAI Developers][1])
 
-Provider-native tool approvals remain the provider’s responsibility, not Reflow’s.
+### A2.6 Resume support
 
-## 5. Primary users
+Codex documents `codex exec resume --last` and `codex exec resume <SESSION_ID>` for continuing prior non-interactive runs. ([OpenAI Developers][1])
 
-Primary users are:
+### A2.7 Repository assumptions
 
-* experienced developers using Codex CLI or Claude Code
-* technical operators building reusable AI loops
-* engineering and operations leads standardizing AI-assisted workflows
+Codex documents that commands normally run inside a Git repository and provides `--skip-git-repo-check` to override this. The orchestrator SHOULD assume a Git repository is present unless the operator intentionally overrides that behavior. ([OpenAI Developers][1])
 
-Secondary users are:
+### A2.8 Project instructions
 
-* analysts or domain experts running terminal-driven workflows under supervision
-* teams that want repeatable, inspectable AI-assisted SOP execution
+Codex automatically discovers `AGENTS.md` with documented precedence and layered lookup from global and project directories. The orchestrator MUST assume Codex is already loading that provider-native instruction chain. It must not duplicate it. ([OpenAI Developers][3])
 
-## 6. Current tooling assumptions
+### A2.9 Native skills
 
-Reflow is designed around current local CLI surfaces.
+Codex native skills live under `.agents/skills`, use `SKILL.md`, and support optional extra files with progressive disclosure. v0.1 MUST NOT depend on that mechanism for correctness, but an implementation MAY optionally generate mirrors later. ([OpenAI Developers][4])
 
-Codex supports non-interactive `codex exec`, structured output constraints, resume, and project guidance through `AGENTS.md`. Claude Code supports programmatic execution with `claude -p`, structured JSON output with a JSON Schema, and project guidance through `CLAUDE.md`. Both tools operate directly against the local repository and workspace, which makes a path-based artifact model workable: Reflow can reference local artifacts by relative path instead of inlining whole files into prompt context. Because provider-native instruction layering already exists, Reflow does **not** manually append `AGENTS.md` or `CLAUDE.md`; it appends only orchestration-owned messages.
+---
 
-## 7. Product principles
+## A3. Claude Code integration surface
 
-### 7.1 Deterministic kernel
+### A3.1 Core command
 
-Reflow owns state and transitions, not business reasoning.
+Use `claude -p` for scripted, non-interactive execution. Claude documents this as the headless / programmatic interface. ([Claude API Docs][5])
 
-### 7.2 File-first
+### A3.2 Structured output
 
-Every meaningful step result is persisted as files and append-only logs.
+Use:
 
-### 7.3 Visible context only
+* `--output-format json`
+* `--json-schema '<schema>'`
 
-The runtime depends only on persisted visible artifacts and orchestrator messages.
+Claude documents that the structured result is returned in the `structured_output` field, with additional metadata such as `session_id` and usage in the JSON response. ([Claude API Docs][5])
 
-### 7.4 Immutable attempts
+### A3.3 Allowed tools
 
-Every retry and every loop iteration creates a new attempt folder. Older attempts are never overwritten.
+Use `--allowedTools` to pre-authorize tools such as `Bash`, `Read`, and `Edit`. Claude documents `--allowedTools` explicitly for headless mode. ([Claude API Docs][5])
 
-### 7.5 Workflow-owned logic
+### A3.4 System prompt extension
 
-Process logic belongs to workflows, not the runtime.
+Use:
 
-### 7.6 Skill-owned role behavior
+* `--append-system-prompt`
+* `--append-system-prompt-file`
 
-Method, constraints, and examples belong to skills.
+Claude documents these as the preferred way to add custom instructions while preserving Claude Code’s built-in behavior. ([Claude][6])
 
-### 7.7 Provider-agnostic workflows
+### A3.5 Continue / resume
 
-Authored workflows must not hardcode provider choice.
+Claude documents:
 
-### 7.8 Small v0.1 surface
+* `--continue` to continue the most recent conversation
+* `--resume <SESSION_ID>` to continue a specific conversation. ([Claude API Docs][5])
 
-Only enough abstraction to run real workflows well.
+### A3.6 Project instructions
 
-## 8. Repository boundary
+Claude automatically loads `CLAUDE.md` and treats it as context at the start of the conversation. The orchestrator MUST assume this provider-native behavior and MUST NOT duplicate that file into the prompt manually. ([Claude API Docs][7])
 
-The repository root may contain normal project files: code, documents, SOPs, examples, tests, and other domain assets.
+### A3.7 Permissions
 
-The `.ai/` folder contains only orchestration-native assets:
+Claude uses a tiered permission system:
 
-* workflow definitions
-* canonical skills
-* orchestrator config
-* helper scripts
-* run outputs
+* read-only tools do not require approval
+* Bash commands require approval unless allowed
+* file modifications require approval unless allowed
+* project settings can define permission rules
+* permission modes include `default`, `acceptEdits`, `plan`, `dontAsk`, `bypassPermissions`. ([Claude][8])
 
-## 9. Canonical v0.1 repository structure
+### A3.8 Native skills
 
-```text
-.ai/
-  config/
-    orchestrator.yaml
-    providers.yaml
-    route_eval.schema.json
+Claude native skills live under `.claude/skills/<skill>/SKILL.md`, support optional supporting files, and are primarily documented for native Claude Code use. User-invoked skills such as `/skill-name` are an interactive-mode feature. v0.1 MUST NOT depend on native Claude skill discovery for correctness. ([Claude API Docs][9])
 
-  workflows/
-    <workflow_name>/
-      workflow.yaml
-      notes.md          # optional
-      schemas/          # optional, workflow-local only
+### A3.9 Hooks
 
-  skills/
-    <skill_name>/
-      SKILL.md
+Claude hooks are deterministic lifecycle shell commands. They are useful later for enforcement, but they are OPTIONAL in v0.1 and MUST NOT be required for orchestrator correctness. ([Claude API Docs][10])
 
-  scripts/
-    run_workflow.py
-    verify.sh
+---
 
-  runs/
-    <run_id>/
-      state.json
-      messages.jsonl
-      <step folders>/
-```
+## A4. Provider selection contract
 
-There is no `.agents/skills` or `.claude/skills` dependency in v0.1.
+Create `.ai/config/providers.yaml`.
 
-## 10. Core concepts
-
-### 10.1 Workflow
-
-A reusable process definition composed of named steps and step-local route rules.
-
-### 10.2 Step
-
-A named unit of work with:
-
-* an action
-* a maximum semantic iteration count
-* an optional retry policy
-* required outputs
-* semantic success and failure conditions
-* optional local routes
-
-### 10.3 Skill
-
-A reusable role package whose primary entrypoint is `SKILL.md`.
-
-### 10.4 Executor
-
-How a step is run. In v0.1:
-
-* `skill`
-* `workflow`
-* `cli`
-
-### 10.5 Run
-
-One concrete execution of a workflow.
-
-### 10.6 Semantic visit
-
-One workflow-level visit to a step for domain work. `max_iter` counts semantic visits, not retries.
-
-### 10.7 Attempt
-
-One execution attempt of a step. Multiple attempts may belong to the same semantic visit if retries occur.
-
-### 10.8 Route evaluation
-
-A separate semantic evaluation pass that determines:
-
-* whether the step succeeded
-* whether the step failed
-* which local routes match
-* which route to take next
-
-### 10.9 Message ledger
-
-The canonical append-only run message history that mimics provider session context.
-
-## 11. Workflow model
-
-Each workflow lives in its own folder and must contain `workflow.yaml`.
-
-Optional workflow-local files:
-
-* `notes.md`
-* `schemas/*`
-
-### 11.1 Required workflow fields
-
-A workflow must contain:
-
-* `name`
-* `steps`
-
-A workflow may contain:
-
-* `description`
-* `entrypoint`
-
-### 11.2 `entrypoint`
-
-If `entrypoint` is omitted, Reflow defaults to the first defined step.
-
-### 11.3 Step cardinality
-
-A workflow must define at least one step.
-
-### 11.4 `notes.md`
-
-`notes.md` is workflow-local orchestration guidance.
-
-It is appended by Reflow into the workflow’s message history and therefore becomes part of the effective provider session context for steps in that workflow.
-
-## 12. Step contract
-
-Each step must support:
-
-* `name`
-* optional `description`
-* `action`
-* `max_iter`
-* optional `retry`
-* optional `context_mode`
-* `outputs.required`
-* `success.when`
-* `failure.when`
-* optional `routes`
-
-### 12.1 `name`
-
-Stable step identifier.
-Slug-like and machine-safe.
-
-### 12.2 `description`
-
-Optional human-readable explanation.
-
-### 12.3 `action`
-
-Must contain:
-
-* `kind`: `skill | workflow | cli`
-* `ref`
-* optional `with`
-
-Examples:
-
-* `kind: skill, ref: review-codebase`
-* `kind: cli, ref: verify.sh`
-* `kind: workflow, ref: nested_workflow_name`
-
-### 12.4 `max_iter`
-
-Maximum number of **semantic visits** to the step within one run.
-
-`max_iter` counts only valid workflow-driven revisits where the domain work needs another pass. It does **not** count retries caused by execution-stage noise or evaluator malfunction.
-
-### 12.5 `retry`
-
-Optional step-level retry policy.
-
-Shape:
-
-```yaml
-retry:
-  max_retries: 2
-```
-
-Rules:
-
-* The first execution of a semantic visit is not counted as a retry.
-* On eligible execution-stage or evaluator-stage failure, Reflow may retry up to `max_retries` additional times before that semantic visit is considered failed.
-* The retry budget resets to its full value at the start of each new semantic visit.
-* Each retry creates a separate attempt folder.
-* Retry reasons are appended to the canonical message ledger.
-* If omitted, the step inherits the default from `orchestrator.yaml`.
-
-Retryable conditions are:
-
-* transient provider execution error such as process crash or timeout
-* malformed provider response
-* malformed `route_eval.json`
-* `route_eval_conflict` (`step_success = true` and `step_failure = true`)
-* ambiguous evaluation (`step_success = false` and `step_failure = false`)
-* local script crash or timeout for `cli` steps
-* missing required outputs
-* routes defined but none match
-
-Non-retryable conditions are:
-
-* provider unavailable (fail fast)
-* semantic failure (`failure.when = true` from a valid, non-conflicting evaluation)
-* `max_iter` exhaustion
-
-### 12.6 `context_mode`
-
-Allowed for any step kind:
-
-* `skill`
-* `workflow`
-* `cli`
-
-Only one value is supported in v0.1:
-
-* `full_run`
-
-Any other value is invalid in v0.1.
-
-### 12.7 `outputs.required`
-
-List of files that must exist in the attempt output directory after execution.
-
-This is structural, not semantic.
-
-### 12.8 `success.when`
-
-Natural-language semantic condition answering:
-“Did this step achieve its local purpose well enough to continue?”
-
-### 12.9 `failure.when`
-
-Natural-language semantic condition answering:
-“Did this step hit a terminal or unrecoverable condition?”
-
-Recoverable conditions should be handled by routing or retry, not by `failure.when`.
-
-### 12.10 `routes`
-
-Ordered local route rules attached to the step.
-
-Each route contains:
-
-* `when`
-* `then`
-
-`then` may target:
-
-* another step name
-* `stop`
-* `escalate`
-
-There is no `from` field because routes are defined on the step itself.
-
-## 13. Skill model
-
-Canonical skills live only under `.ai/skills`.
-
-v0.1 convention:
-
-* `SKILL.md` is the canonical skill entrypoint
-* extra support files are allowed but not required or assumed by default
-* Reflow is only required to load `SKILL.md` in v0.1
-
-Reflow never exposes the full skill library to a single step. It loads only the current step’s selected skill.
-
-### 13.1 Working directory semantics
-
-By default, all `skill` and `workflow` actions run from the directory where Reflow was launched.
-
-`cli` steps may override the working directory through `action.with.cwd`.
-
-Child workflows inherit the parent run’s working directory in v0.1.
-
-This matters because provider-native project instruction discovery is sensitive to working directory and repository hierarchy. Reflow must keep working-directory behavior stable across parent and child runs.
-
-## 14. Provider selection
-
-Provider selection lives in `.ai/config/providers.yaml`.
-
-It maps:
-
-* skill names to providers
-* workflow steps to providers, if needed
-* router to a provider
-* provider profiles and flags
-
-Workflows themselves do not specify provider choice.
-
-### 14.1 Provider failure behavior
-
-If the configured provider for a step or route evaluator is unavailable, Reflow fails fast.
-
-There is no automatic fallback in v0.1.
-
-### 14.2 Failure recording
-
-Provider-unavailable failures must be written to:
-
-* `messages.jsonl`
-* `attempt.json`
-* `state.json`
-
-### 14.3 Configuration files
-
-#### 14.3.1 `orchestrator.yaml`
-
-`orchestrator.yaml` must support:
-
-* run ID format
-* default `context_mode` (`full_run` only in v0.1)
-* default `max_retries` when a step omits `retry` (recommended default: `1`)
-* placeholder `retry_backoff` field reserved for the future, not implemented in v0.1
-* terminal UX settings
-* behavior for unresolved routing after retries are exhausted
-
-#### 14.3.2 `providers.yaml`
-
-`providers.yaml` must support:
-
-* provider mapping per skill
-* provider mapping per workflow, if needed
-* provider mapping for router
-* provider-specific command templates and flags
-
-Conceptual example:
+Minimum contract:
 
 ```yaml
 defaults:
@@ -484,365 +157,230 @@ skills:
   implement-screened-findings: codex
 
 workflows:
-  review_analyze_do: local
+  nested_workflow_name: claude
+
+profiles:
+  codex:
+    command: codex
+    model: <string-or-null>
+    cd_flag: --cd
+    sandbox: read-only
+    approval: never
+
+  claude:
+    command: claude
+    allowed_tools_skill: "Bash,Read,Edit"
+    allowed_tools_router: "Read"
+    output_format: json
 ```
 
-## 15. Provider approvals
+Rules:
 
-Reflow does not implement human approval gates in v0.1.
+1. Workflow files MUST NOT hardcode provider choice.
+2. The orchestrator MUST resolve providers only through `providers.yaml`.
+3. If the configured provider executable is missing, not authenticated, or unavailable, the run MUST fail fast.
+4. There is no fallback provider in v0.1.
 
-Provider-native execution approvals remain external to Reflow:
+---
 
-* Codex uses whatever sandbox and approval settings are configured for that invocation
-* Claude Code uses its own permission model and prompts for additional actions as needed
+## A5. Canonical run state and statuses
 
-Reflow records execution results, but it does not mediate or store business approvals in v0.1.
-
-## 16. Runtime statuses
-
-Canonical run statuses in v0.1:
+Use only these run statuses in v0.1:
 
 * `running`
 * `completed`
 * `failed`
 * `escalated`
 
-### 16.1 Meaning of statuses
+Do not implement a separate `stopped` or `error` state.
 
-* `completed`: workflow reached its intended successful terminal condition
-* `failed`: workflow or runtime terminated unsuccessfully
-* `escalated`: workflow intentionally handed off because automated continuation is not appropriate
-
-Failure diagnostics are captured through `failure_type` and `failure_reason` fields in runtime artifacts.
+Use `failure_type` and `failure_reason` fields instead of extra top-level statuses.
 
 Examples of `failure_type`:
 
-* `semantic_failure`
 * `provider_unavailable`
+* `missing_required_outputs`
 * `route_unresolved`
 * `route_eval_conflict`
-* `ambiguous_evaluation`
-* `missing_required_outputs`
-* `retries_exhausted`
 * `invalid_provider_response`
 * `filesystem_error`
+* `semantic_failure`
 
-## 17. Full-run context model
+---
 
-This is the most important runtime rule.
+## A6. Canonical message ledger (`messages.jsonl`)
 
-`full_run` means Reflow maintains a **canonical append-only message ledger** that mimics provider session context history.
+This is the most important runtime contract.
 
-Each orchestrator instruction appends a message.
-Each provider output appends a message.
-Future steps continue from that accumulated history.
+### A6.1 Purpose
 
-Artifacts stay on disk and are referenced by full relative file path.
-Reflow does **not** inline whole artifact files into prompt context by default.
+`messages.jsonl` is the authoritative, replayable approximation of provider session history.
 
-### 17.1 Canonical source of truth
+It MUST be append-only.
+It MUST preserve message order.
+It MUST be the canonical source for `full_run` context.
 
-The source of truth for v0.1 context is:
+### A6.2 Message record shape
 
-* `messages.jsonl`
-* referenced artifacts in the workspace
+Each line MUST be one JSON object with at least:
 
-Provider-native session continuation may be used as an implementation optimization, but it is **not** the source of truth.
+```json
+{
+  "seq": 1,
+  "ts": "2026-03-10T12:00:00Z",
+  "role": "orchestrator",
+  "kind": "step_instruction",
+  "workflow": "review_analyze_do",
+  "step": "review_codebase",
+  "attempt": 1,
+  "provider": "codex",
+  "text": "Human-readable message content",
+  "artifact_paths": [
+    ".ai/runs/run_.../010_review_codebase/attempt_001/output/findings.json"
+  ]
+}
+```
 
-### 17.2 What gets appended as messages
+### A6.3 Allowed `role` values
 
-Reflow appends messages such as:
+Use:
 
-* workflow setup message
-* workflow notes message
-* step instruction message
-* retry reason message
-* provider response message
-* CLI result summary message
-* route evaluation result message
-* transition message
-* failure message
+* `system`
+* `orchestrator`
+* `provider`
+* `cli`
 
-### 17.3 Step message contents
+Do not use hidden or private roles.
 
-A step instruction message should include:
+### A6.4 Allowed `kind` values
 
-* current workflow name
-* current step name
-* step description
-* required outputs
-* semantic success condition
-* semantic failure condition
-* local routes
-* current skill text if the step uses `action.kind: skill`
-* relative paths to relevant artifacts
+Minimum v0.1 kinds:
 
-### 17.4 Artifact references
+* `workflow_setup`
+* `workflow_notes`
+* `step_instruction`
+* `retry_reason`
+* `provider_response`
+* `cli_result`
+* `route_evaluation`
+* `transition`
+* `failure`
 
-Generated artifacts must be referenced in message history by **full relative file path**.
+### A6.5 Artifact references
 
-Reflow must not inline full artifact bodies into context by default.
+`artifact_paths` MUST contain **relative file paths** from the repository root.
+Do not inline full artifact contents into the ledger by default.
 
-### 17.5 Historical outputs
+### A6.6 What “full_run” means
 
-Earlier attempts remain available as history even if no longer current.
-The provider is expected to infer current relevance from message order, recent step outputs, and artifact references.
+`full_run` means:
 
-## 18. Nested workflows
+* the full canonical `messages.jsonl` history in order
+* plus access to referenced artifacts by path in the workspace
 
-Nested workflows are fully in scope for v0.1.
+It does **not** mean copying every artifact body into the prompt.
 
-A step with `action.kind: workflow` launches a child run.
+### A6.7 Provider replay rule
 
-### 18.1 Child run behavior
+The orchestrator MUST be able to reconstruct provider input from `messages.jsonl` and on-disk artifacts alone.
 
-The child run:
+Provider-native resume (`codex exec resume`, `claude --continue` / `--resume`) MAY be used as an optimization, but correctness MUST NOT depend on them. Codex and Claude both document resume/continue features, but the orchestrator’s own ledger remains the source of truth. ([OpenAI Developers][1])
 
-* has its own run folder
-* has its own `state.json` and message ledger
-* records its parent run and parent step reference
+---
 
-### 18.2 Parent/child linking
+## A7. Context assembly algorithm
 
-The parent attempt records:
+For every step execution, the orchestrator MUST construct provider context as follows.
 
-* `child_run_id`
-* `child_workflow_name`
+### A7.1 Common rules
 
-### 18.3 Child context
+1. Do not manually append `AGENTS.md` or `CLAUDE.md`.
+2. Do append workflow-local `notes.md` as an orchestrator message if it exists.
+3. If `action.kind = skill`, append the selected `.ai/skills/<skill>/SKILL.md` as an orchestrator message.
+4. Append the step contract summary as an orchestrator message:
 
-Subworkflows support `context_mode`.
-
-In v0.1, `context_mode` defaults to `full_run`, meaning the child inherits the full visible parent message history at launch and then appends its own messages during execution.
-
-### 18.4 Parent completion rule
-
-A workflow step completes when its child run reaches a terminal state.
-
-The parent sees:
-
-* the child run’s full visible message history
-* child run id
-* child terminal status
-* child state reference
-
-### 18.5 Child semantics
-
-A nested workflow step supports:
-
-* `success.when`
-* `failure.when`
-* `routes`
-
-exactly like any other step.
-
-### 18.6 Child retry behavior
-
-If a parent step invoking a child workflow is retried, the child workflow is executed again as a new child run. No special retry semantics exist for nested workflows in v0.1.
-
-## 19. Route evaluation model
-
-Route evaluation is externalized.
-
-After each attempt, Reflow must run **one** semantic evaluation pass that evaluates:
-
-* local step success
-* local step failure
-* all local routes in order
-
-The evaluator must return JSON.
-
-### 19.1 `route_eval.json`
-
-Each attempt produces a `route_eval.json` artifact with at least:
-
-* `step_success`
-* `step_failure`
-* `matched_routes`
-* `selected_route`
-* `reason`
-* `confidence`
-
-### 19.2 Contract notes
-
-* `selected_route` must equal the first entry in `matched_routes`
-* `selected_route` may be `null` only when no route matched
-* `matched_routes` must preserve route order
-* `reason` should reference current evidence from persisted artifacts
-* `confidence` is advisory only and not used for routing in v0.1
-
-### 19.3 Evaluation order
-
-For each attempt:
-
-1. Execute the step
-2. Check deterministic failures
-3. Run one semantic evaluation pass
-4. Persist `route_eval.json`
-5. Resolve next transition
-
-### 19.4 Conflict rule
-
-If `step_success = true` and `step_failure = true`, treat the result as `route_eval_conflict`.
-
-Retry using the **retry budget** for the current semantic visit.
-If retries are exhausted, fail the run.
-
-This conflict does **not** consume `max_iter`.
-
-## 20. Deterministic checks before semantic routing
-
-Reflow must first evaluate deterministic runtime facts.
-
-The evaluation sequence is:
-
-1. Attempt step execution
-2. If execution-stage failure occurred, apply retry policy directly and skip semantic evaluation
-3. Check whether required outputs exist
-4. If required outputs are missing, apply retry policy directly and skip semantic evaluation
-5. Check whether the next semantic visit would exceed `max_iter`
-6. Then proceed to semantic evaluation
-
-The key rule is: if the provider process crashed, timed out, or failed to produce the required outputs, there is nothing meaningful to semantically evaluate.
-
-### 20.1 Semantic visit increment rule
-
-When workflow routing selects a step, Reflow begins a new **semantic visit**.
-
-Before executing that visit, it checks whether `semantic_iteration_number + 1 > max_iter`.
-
-* If yes, the run fails with `max iteration exceeded`
-* If no, it increments `semantic_iteration_number` and starts attempt `retry_number = 0`
-
-Retries within that visit do not increment `semantic_iteration_number`.
-
-### 20.2 Error and diagnostic messaging
-
-On every runtime failure Reflow detects, it must append a descriptive error message to all three of:
-
-* `messages.jsonl`
-* `attempt.json`
-* `state.json`
-
-Error messages must state:
-
-* what failed, using a specific `failure_type`
-* whether a retry will occur
-* remaining retry count for this semantic visit
-* current semantic iteration usage (for example, `semantic visit 2 of 3`)
-
-Reflow must never silently swallow a failure. If something goes wrong, there must be a written record in all three locations.
-
-## 21. Retry policy
-
-### 21.1 Scope
-
-Retry is for **execution-stage and evaluator-stage failures that prevent a clean semantic outcome**.
-
-It protects the semantic iteration budget (`max_iter`) from being consumed by infrastructure noise or evaluator malfunction.
-
-### 21.2 Independence
-
-`retry` and `max_iter` are independent counters.
-
-* `max_iter` counts how many times the workflow semantically routes to a step
-* `retry.max_retries` counts how many times one semantic visit can recover from execution-stage or evaluator-stage failure
-
-The retry counter resets to its full budget at the start of each new semantic visit.
-
-Worst-case attempt count for one step:
-
-`max_iter × (1 + max_retries)`
-
-### 21.3 Provider unavailable
-
-Provider unavailable bypasses retry and fails fast.
-
-### 21.4 Retryable conditions
-
-The following conditions consume from the retry budget:
-
-* missing required outputs
-* malformed structured output from provider
-* malformed `route_eval.json`
-* `route_eval_conflict` (`step_success` and `step_failure` both true)
-* ambiguous evaluation (`step_success` and `step_failure` both false)
-* routes defined but none match
-* provider process crash or timeout
-* local script crash or timeout
-
-### 21.5 Non-retryable conditions
-
-The following are not retryable by the kernel:
-
-* provider unavailable → fail fast
-* semantic failure (`failure.when = true` from a valid, non-conflicting evaluation)
-* `max_iter` exhaustion → fail
-
-### 21.6 Retry artifacts
-
-Each retry creates:
-
-* a new attempt folder
-* a new `attempt.json`
-* a new error entry
-* a new retry-reason message in `messages.jsonl`
-
-### 21.7 Retry exhaustion
-
-If retries are exhausted for a semantic visit and the condition persists, the run fails.
-
-`failure_type` should distinguish the cause, for example:
-
-* `retries_exhausted_missing_outputs`
-* `retries_exhausted_route_conflict`
-* `retries_exhausted_ambiguous_evaluation`
-
-### 21.8 No-routes-defined rule
-
-If a step defines no routes:
-
-* on semantic success, proceed to the next step in workflow order
-* if it is the last step, resolve terminal status as `completed`
-* on semantic failure, fail
-* if neither success nor failure is true, treat it as ambiguous evaluation and use the retry budget
-
-Ambiguous evaluations are evaluator malfunction. They do **not** consume `max_iter`.
-
-## 22. Transition semantics
-
-`then: stop` is a transition action, not a stored run state.
-
-If `selected_route = stop`:
-
-* and `step_failure = false`, terminal status resolves to `completed`
-* and `step_failure = true`, terminal status resolves to `failed`
-
-If `selected_route = escalate`, terminal status resolves to `escalated`.
-
-`stop` must be logged both in:
-
-* `route_eval.json` as `selected_route: "stop"`
-* `messages.jsonl` as a transition message that records the terminal status resolution
-
-Failure and route precedence:
-
-* if `step_success = true` and `step_failure = true` → apply retry policy
-* if `step_failure = true` and `selected_route = escalate` → `escalated`
-* if `step_failure = true` and no escalation route applies → `failed`
-* otherwise follow `selected_route`
-
-## 23. Runtime artifact structure
-
-Each run must contain:
-
-* `state.json`
-* `messages.jsonl`
-* one folder per step
-
-Each step folder contains one folder per attempt.
-
-Each attempt contains:
+   * step name
+   * description
+   * required outputs
+   * success condition
+   * failure condition
+   * local routes
+5. Append only path references to artifacts in `artifact_paths`.
+6. On retries, append a `retry_reason` message before invoking the provider again.
+
+### A7.2 Do not do these things
+
+* do not append the full skill library
+* do not append all artifact bodies
+* do not depend on hidden provider memory
+* do not synthesize stale/superseded labels in the orchestrator unless a workflow explicitly writes them
+
+### A7.3 CLI steps
+
+CLI steps do not receive prompt context. Instead, the orchestrator MUST materialize context through files and environment variables.
+
+Required environment variables for CLI steps:
+
+* `AI_WORKFLOW_NAME`
+* `AI_RUN_ID`
+* `AI_STEP_NAME`
+* `AI_ATTEMPT`
+* `AI_WORKSPACE_ROOT`
+* `AI_RUN_DIR`
+* `AI_STEP_DIR`
+* `AI_ATTEMPT_DIR`
+* `AI_OUTPUT_DIR`
+* `AI_MANIFEST_PATH`
+* `AI_SUMMARY_PATH`
+* `AI_MESSAGES_PATH`
+
+The CLI script is expected to read these paths directly.
+
+---
+
+## A8. Workflow contract (`workflow.yaml`)
+
+Minimum workflow file shape:
+
+```yaml
+name: review_analyze_do
+description: Review, screen, implement, verify in a loop.
+entrypoint: review_codebase
+
+steps:
+  - name: review_codebase
+    description: Review the codebase and produce findings.
+    action:
+      kind: skill
+      ref: review-codebase
+      with: {}
+    max_iter: 8
+    context_mode: full_run
+    outputs:
+      required:
+        - review_output.md
+        - findings.json
+    success:
+      when: The required outputs exist and the findings are concrete and non-empty.
+    failure:
+      when: The review could not inspect the code or the findings are contradictory or unusable.
+    routes:
+      - when: The latest review output is ready to be screened.
+        then: screen_findings
+```
+
+Rules:
+
+1. `context_mode` is optional in authored files.
+2. If omitted, the orchestrator MUST treat it as `full_run`.
+3. In v0.1, any value other than `full_run` is invalid configuration.
+4. Routes are step-local and ordered.
+
+---
+
+## A9. Attempt artifact contracts
+
+Each attempt folder MUST contain:
 
 * `input.json`
 * `attempt.json`
@@ -850,249 +388,361 @@ Each attempt contains:
 * `logs/`
 * `output/`
 
-### 23.1 `state.json`
+### A9.1 `input.json`
+
+Minimum fields:
+
+```json
+{
+  "workflow": "review_analyze_do",
+  "step": "review_codebase",
+  "attempt": 1,
+  "provider": "codex",
+  "action": {
+    "kind": "skill",
+    "ref": "review-codebase",
+    "with": {}
+  },
+  "context_mode": "full_run",
+  "required_outputs": ["review_output.md", "findings.json"],
+  "success_when": "...",
+  "failure_when": "...",
+  "routes": [
+    {"when": "...", "then": "screen_findings"}
+  ],
+  "artifact_paths": []
+}
+```
+
+### A9.2 `attempt.json`
+
+Minimum fields:
+
+```json
+{
+  "workflow": "review_analyze_do",
+  "step": "review_codebase",
+  "attempt": 1,
+  "provider": "codex",
+  "started_at": "2026-03-10T12:00:00Z",
+  "ended_at": "2026-03-10T12:00:20Z",
+  "status": "completed",
+  "failure_type": null,
+  "failure_reason": null,
+  "output_paths": [
+    ".ai/runs/run_x/010_review_codebase/attempt_001/output/review_output.md",
+    ".ai/runs/run_x/010_review_codebase/attempt_001/output/findings.json"
+  ]
+}
+```
+
+### A9.3 `route_eval.json`
+
+Minimum fields:
+
+```json
+{
+  "step_success": true,
+  "step_failure": false,
+  "matched_routes": ["screen_findings"],
+  "selected_route": "screen_findings",
+  "reason": "The latest review output is ready to be screened.",
+  "confidence": 0.94
+}
+```
+
+Rules:
+
+* `selected_route` MUST equal the first element of `matched_routes`
+* `selected_route` MAY be `null` only if `matched_routes` is empty
+
+---
+
+## A10. Route-evaluator contract
+
+The route evaluator MUST evaluate:
+
+* the step’s success condition
+* the step’s failure condition
+* all step-local routes in one pass
+
+It MUST return JSON conforming to `route_eval.schema.json`.
+
+### A10.1 Codex route-evaluator invocation
+
+Use Codex structured output:
+
+```bash
+codex exec --cd "$WORKSPACE" \
+  --sandbox read-only \
+  --ask-for-approval never \
+  --output-schema .ai/config/route_eval.schema.json \
+  -o "$ATTEMPT_DIR/route_eval.json" \
+  "<route-evaluator prompt>"
+```
+
+Codex documents `--output-schema`, `-o`, `--cd`, `--sandbox`, and read-only default behavior for automation. ([OpenAI Developers][1])
+
+### A10.2 Claude route-evaluator invocation
 
-Contains:
+Use Claude structured output:
+
+```bash
+claude -p "<route-evaluator prompt>" \
+  --output-format json \
+  --json-schema "$(cat .ai/config/route_eval.schema.json)" \
+  --allowedTools "Read"
+```
 
-* run id
-* workflow name
-* workflow version or hash
-* current status
-* current step
-* semantic visit counts per step
-* current retry counts per step for the active semantic visit
-* start and end timestamps
-* workspace path
-* parent linkage if child run
-* current failure type and reason, if any
+Claude documents `-p`, `--output-format json`, `--json-schema`, and `--allowedTools`. The structured result is returned in `structured_output`. ([Claude API Docs][5])
 
-`state.json` is the mutable current-state snapshot, not a historical log.
+### A10.3 Route evaluator prompt requirements
 
-### 23.2 `messages.jsonl`
+The prompt MUST instruct the evaluator to:
 
-Canonical append-only message history for the run.
+* use only persisted visible evidence
+* treat missing evidence as false
+* evaluate success, failure, and all routes in one pass
+* preserve route order
+* return JSON only
 
-This is the source of truth for `full_run` context and should be replayable into provider calls.
+---
 
-Retry-reason messages are part of the canonical ledger and must be visible to the provider on the next attempt.
+## A11. Retry and terminal state algorithm
 
-Each message record must include at least:
+For each attempt:
 
-* `seq`
-* `ts`
-* `role`
-* `kind`
-* `text`
-* optional `artifact_paths`
+1. Execute the step.
+2. Check deterministic failures:
 
-Recommended additional fields:
+   * provider unavailable
+   * step executable missing
+   * malformed provider response that cannot be parsed
+   * missing required outputs
+   * `max_iter` exceeded
+3. If deterministic failure is retryable and `max_iter` remains, append a `retry_reason` message and retry.
+4. Otherwise run one route-evaluator pass.
+5. If `step_success = true` and `step_failure = true`, treat as `route_eval_conflict`; retry if allowed, else fail.
+6. If routes exist and none match, treat as `route_unresolved`; retry if allowed, else fail.
+7. If `selected_route = escalate`, set run status to `escalated`.
+8. If `selected_route = stop`, set run status:
 
-* `workflow`
-* `step`
-* `attempt`
+   * `completed` if `step_failure = false`
+   * `failed` if `step_failure = true`
+9. If no routes exist:
 
-### 23.3 `input.json`
+   * on semantic success, continue to next step in workflow order
+   * on semantic failure, fail
+   * if neither success nor failure is true, retry if allowed, else fail
 
-Records:
+### A11.1 Non-retryable failures
 
-* action
-* provider selected
-* context mode
-* required outputs
-* success and failure conditions
-* local routes
-* referenced artifact paths
+Do not retry:
 
-### 23.4 `attempt.json`
+* provider unavailable
+* semantic failure (`failure.when = true`)
+* explicit `selected_route = escalate`
+* operator-aborted runs, if you implement operator abort
 
-Records:
+---
 
-* semantic_iteration_number
-* retry_number (`0` for first execution of a semantic visit)
-* retry_remaining
-* step name
-* provider
-* timestamps
-* execution status
-* retry reason if applicable
-* failure_type if applicable
-* failure_reason if applicable
-* output references
-* child workflow reference if applicable
+## A12. Nested workflow algorithm
 
-### 23.5 `output/`
+When `action.kind = workflow`:
 
-Contains domain outputs of that attempt.
+1. Create child run directory.
+2. Write child `manifest.json`, `summary.json`, and `messages.jsonl`.
+3. Copy/inherit parent message ledger semantics:
 
-### 23.6 `logs/`
+   * child starts with inherited visible context according to `context_mode`
+   * default is `full_run`
+4. Execute child workflow until terminal state.
+5. Parent attempt records:
 
-Contains provider-specific raw output or local execution logs.
+   * `child_run_id`
+   * `child_workflow_name`
+   * `child_status`
+   * `child_summary_path`
+   * `child_manifest_path`
+6. Parent route evaluation then uses:
 
-## 24. Workflow notes and schemas
+   * the child’s terminal state
+   * the child’s visible message history
+   * the child’s artifacts by path
 
-### 24.1 `notes.md`
+---
 
-Optional, workflow-local.
-Appended to the orchestrator message history for that workflow.
+## A13. Skill loading algorithm
 
-### 24.2 Local schemas
+Given a step with:
 
-Optional, workflow-local only.
-Used only when a workflow needs stronger structured validation.
+```yaml
+action:
+  kind: skill
+  ref: review-codebase
+```
 
-There is no central schema registry in v0.1.
+the orchestrator MUST load:
 
-## 25. CLI actions
+```text
+.ai/skills/review-codebase/SKILL.md
+```
 
-`action.kind: cli` invokes a local script or command alias.
+and append its content as an orchestrator message to the message ledger before the provider call.
 
-`action.with` may include:
+Do not rely on `.agents/skills` or `.claude/skills` in v0.1.
 
-* `cwd`
-* `timeout_sec`
-* small executor-specific parameters
+Codex and Claude both document native skill directories, but this project chooses not to depend on them. ([OpenAI Developers][4])
 
-### 25.1 CLI context delivery
+---
 
-For CLI steps, Reflow must materialize context as:
+## A14. Codex worker command template
 
-* message ledger path
-* state path
-* relevant artifact paths
-* output directory path
-* working directory
+Use this shape for skill or workflow steps that run through Codex:
 
-This is typically provided through files and environment variables, not prompt context.
+```bash
+codex exec --cd "$WORKSPACE" \
+  --ask-for-approval never \
+  --json \
+  "<assembled step prompt>"
+```
 
-## 26. Minimal terminal UX
+If the step needs write access, add either:
 
-Reflow is terminal-first in v0.1.
+* `--full-auto`
+* or a broader sandbox setting
 
-Required terminal capabilities:
+Codex documents read-only default behavior, JSONL event output via `--json`, and the use of explicit sandbox/approval settings for automation. ([OpenAI Developers][1])
 
-* start a workflow run
-* show current status
-* display failures clearly
-* show retry reasons
-* inspect run artifact paths
-* issue an operator stop command
+Store:
 
-An operator stop terminates the run with terminal status `escalated`.
+* raw JSONL stream under `logs/provider.jsonl`
+* final text result by extracting the last agent message from the JSONL if needed
 
-### 26.1 CLI exit codes
+If you want native session continuation for same-provider optimization, use:
 
-The implementation must differentiate CLI exit categories.
+* `codex exec resume --last`
+* or `codex exec resume <SESSION_ID>`
 
-Recommended default codes:
+but correctness MUST remain reconstructible from `messages.jsonl`. ([OpenAI Developers][1])
 
-| Code | Meaning                                                                                               |
-| ---- | ----------------------------------------------------------------------------------------------------- |
-| 0    | Run completed successfully                                                                            |
-| 20   | Provider unavailable (fail fast)                                                                      |
-| 21   | Terminal step failure, including semantic failure and execution-stage failure after retries exhausted |
-| 22   | Unresolved routing, route conflict, or ambiguous evaluation after retries exhausted                   |
-| 23   | Max iteration exceeded                                                                                |
-| 24   | Escalated (operator stop or workflow escalation)                                                      |
-| 25   | Internal orchestrator or runtime error                                                                |
+---
 
-Exact numeric values are not mandatory, but stable differentiation between these categories **is** mandatory and must be documented per deployment.
+## A15. Claude worker command template
 
-## 27. Acceptance criteria
+Use this shape for skill or workflow steps that run through Claude:
 
-Reflow is acceptable when it can do all of the following.
+```bash
+claude -p "<task prompt>" \
+  --append-system-prompt-file "$APPEND_FILE" \
+  --output-format json \
+  --allowedTools "Bash,Read,Edit"
+```
 
-### 27.1 Repository scaffold
+If you need structured output from the step itself, add:
 
-Create and load:
+```bash
+--json-schema "$(cat path/to/schema.json)"
+```
 
-* `.ai/config/`
-* `.ai/workflows/`
-* `.ai/skills/`
-* `.ai/scripts/`
-* `.ai/runs/`
+Claude documents `--append-system-prompt-file` as the safest way to add custom instructions while preserving default behavior, and documents structured JSON output and allowed tools in headless mode. ([Claude][6])
 
-### 27.2 Concrete workflow execution
+Store:
 
-Run the `review_analyze_do` workflow end to end.
+* raw JSON response under `logs/provider.json`
+* the human-visible provider message under a `provider_response` entry in `messages.jsonl`
+* if structured output was requested, extract `structured_output`
 
-### 27.3 Immutable attempts
+If you want native session continuation for same-provider optimization, use:
 
-Produce separate attempt folders for looped steps.
+* `--continue`
+* or `--resume <SESSION_ID>`
 
-### 27.4 Semantic routing
+but correctness MUST remain reconstructible from `messages.jsonl`. ([Claude API Docs][5])
 
-Evaluate success, failure, and all local routes in one pass and persist `route_eval.json`.
+---
 
-### 27.5 Retry behavior
+## A16. Message composition for one step
 
-Retry execution-stage failures (provider timeout, malformed response, malformed evaluator output, route conflicts, ambiguous evaluations, unresolved routes, missing outputs) using the step-level retry budget without consuming `max_iter`. Append retry reasons as messages to the canonical ledger. Verify that `max_iter` is only consumed by valid semantic revisits driven by workflow routing, never by evaluator malfunction.
+The orchestrator MUST append the following messages, in order, for a normal skill step:
 
-### 27.6 Provider failure behavior
+1. `workflow_notes`
+   if `notes.md` exists and has not already been appended for the workflow context
 
-Fail fast when the configured provider is unavailable.
+2. `step_instruction`
+   includes:
 
-### 27.7 Nested workflows
+   * step name
+   * description
+   * required outputs
+   * success condition
+   * failure condition
+   * routes
 
-Run a child workflow and persist separate parent and child run artifacts.
+3. `skill_text`
+   the exact `SKILL.md` content of the current skill
 
-### 27.8 Context behavior
+4. `retry_reason`
+   only if retrying
 
-Use full visible run context by default, with context represented as canonical message history plus artifact path references.
+5. `provider_response`
+   concise provider message plus artifact paths
 
-### 27.9 Error diagnostics
+6. `route_evaluation`
+   selected JSON result plus artifact path
 
-Every runtime failure appends descriptive error messages to `messages.jsonl`, `attempt.json`, and `state.json`, including failure type, retry state, and iteration budget usage.
+7. `transition`
+   next step, stop, fail, or escalate
 
-### 27.10 CLI exit codes
+---
 
-Reflow returns differentiated exit codes for success, provider unavailable, terminal step failure, routing failure, max iteration exceeded, escalation, and internal runtime error.
+## A17. What an implementation MUST NOT do
 
-## 28. Risks
+Do not:
 
-### 28.1 Context growth
+* duplicate `AGENTS.md` or `CLAUDE.md` manually
+* expose the full `.ai/skills` library to every step
+* inline full artifact files into every prompt by default
+* depend on hidden provider-private memory
+* make provider-native skill mirrors required for correctness
+* invent extra runtime statuses beyond:
 
-Full-run message history is intentionally simple but will eventually grow large. This is accepted in v0.1.
+  * `running`
+  * `completed`
+  * `failed`
+  * `escalated`
 
-### 28.2 Route ambiguity
+---
 
-Natural-language conditions can drift if written vaguely.
+## A18. Minimal implementation checklist
 
-Mitigation:
-use controlled natural language and preserve route-evaluation artifacts.
+An implementation is sufficient if it can do all of the following:
 
-### 28.3 Provider mismatch
+1. Read `workflow.yaml`
+2. Resolve providers from `providers.yaml`
+3. Create run folders and attempt folders
+4. Maintain `messages.jsonl`
+5. Execute `skill`, `workflow`, and `cli` steps
+6. Materialize CLI context through paths and env vars
+7. Enforce required outputs
+8. Run one route-evaluator pass per attempt
+9. Retry kernel-level failures up to `max_iter`
+10. Preserve every attempt immutably
+11. Fail fast on provider unavailability
+12. Execute child workflows
+13. Reach `completed`, `failed`, or `escalated` deterministically
 
-Codex and Claude do not expose identical native surfaces.
+---
 
-Mitigation:
-keep authored workflows provider-agnostic and isolate provider behavior in config and adapters.
+This appendix is the implementation reference. If you want, I can now turn it into a frozen `APPENDIX.md` artifact alongside the PRD.
 
-### 28.4 Retry budget interaction
-
-The worst-case attempt count for a step is:
-
-`max_iter × (1 + max_retries)`
-
-For a step with `max_iter: 5` and `max_retries: 3`, this is 20 attempts.
-
-Mitigation:
-
-* keep defaults conservative (`max_retries: 1`)
-* surface current retry and iteration counts in `state.json`
-* document the interaction clearly in workflow authoring guidance
-
-## 29. Roadmap beyond v0.1
-
-Likely future work:
-
-* context pruning and compilation
-* richer CLI action contract
-* optional orchestrator-level approvals
-* optional provider-native skill mirrors
-* richer child-output mapping for nested workflows
-* additional workflows outside code review
-* optional daemon or service mode if local CLI proves too limiting
-
-## 30. Final product position
-
-Reflow v0.1 is a deterministic, file-first, terminal-native runtime for reusable AI workflows. It uses current Codex and Claude CLI capabilities for execution, but keeps workflow state, routing, retries, and attempt history external to the providers. It models full-run context as a canonical message ledger plus artifact path references, not as repeated full-file prompt dumps. It prefers explicit orchestration over ambient agent behavior, preserves every attempt as inspectable history, and intentionally separates execution-stage retry from semantic iteration budgets so infrastructure flakiness does not consume workflow convergence capacity.
+[1]: https://developers.openai.com/codex/noninteractive/ "Non-interactive mode"
+[2]: https://developers.openai.com/codex/cli/reference/ "Command line options"
+[3]: https://developers.openai.com/codex/guides/agents-md/ "Custom instructions with AGENTS.md"
+[4]: https://developers.openai.com/codex/skills/ "Agent Skills"
+[5]: https://docs.anthropic.com/en/docs/claude-code/headless "Run Claude Code programmatically - Claude Code Docs"
+[6]: https://code.claude.com/docs/en/cli-reference "CLI reference - Claude Code Docs"
+[7]: https://docs.anthropic.com/en/docs/claude-code/settings "Claude Code settings - Claude Code Docs"
+[8]: https://code.claude.com/docs/en/permissions "Configure permissions - Claude Code Docs"
+[9]: https://docs.anthropic.com/en/docs/claude-code/slash-commands "Extend Claude with skills - Claude Code Docs"
+[10]: https://docs.anthropic.com/en/docs/claude-code/hooks-guide "Automate workflows with hooks - Claude Code Docs"

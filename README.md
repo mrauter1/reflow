@@ -1,6 +1,6 @@
 # reflow
 
-Deterministic workflow runtime for AI coding agents.
+Deterministic workflow runtime for AI agents.
 
 ## The loop you're already running
 
